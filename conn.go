@@ -153,6 +153,12 @@ type conn struct {
 	// round-trip mode for non-prepared Query calls.
 	binaryParameters bool
 
+	// Timeouts for read and write operations against the database server.
+	// A duration of 0 indicates no timeout.
+	// specified in milliseconds
+	readTimeout  time.Duration
+	writeTimeout time.Duration
+
 	// If true this connection is in the middle of a COPY
 	inCopy bool
 
@@ -180,7 +186,28 @@ func (cn *conn) handleDriverSettings(o values) (err error) {
 		}
 		return nil
 	}
+	timeSetting := func(key string, val *time.Duration) error {
+		if value := o[key]; value != "" {
+			timeout, err := strconv.Atoi(value)
+			if err != nil {
+				return err
+			}
+			// timeout is specified in milliseconds.
+			*val = time.Duration(timeout) * time.Millisecond
+		} else {
+			*val = time.Duration(0) * time.Millisecond
+		}
+		return nil
+	}
 
+	err = timeSetting("read_timeout", &cn.readTimeout)
+	if err != nil {
+		return err
+	}
+	err = timeSetting("write_timeout", &cn.writeTimeout)
+	if err != nil {
+		return err
+	}
 	err = boolSetting("disable_prepared_binary_result", &cn.disablePreparedBinaryResult)
 	if err != nil {
 		return err
@@ -924,7 +951,37 @@ func (se *safeRetryError) Error() string {
 	return se.Err.Error()
 }
 
+// Set the write deadline if we have a write timeout set.
+func (cn *conn) setWriteTimeout() {
+	if cn.writeTimeout != 0 {
+		cn.c.SetWriteDeadline(time.Now().Add(cn.writeTimeout))
+	}
+}
+
+// Clear the write deadline if we set one.
+func (cn *conn) cleanWriteTimeout() {
+	if cn.writeTimeout != 0 {
+		cn.c.SetWriteDeadline(time.Time{})
+	}
+}
+
+// Set the read deadline if we have a read timeout set.
+func (cn *conn) setReadTimeout() {
+	if cn.readTimeout != 0 {
+		cn.c.SetReadDeadline(time.Now().Add(cn.readTimeout))
+	}
+}
+
+// Clear the read deadline if we set one.
+func (cn *conn) cleanReadTimeout() {
+	if cn.readTimeout != 0 {
+		cn.c.SetReadDeadline(time.Time{})
+	}
+}
+
 func (cn *conn) send(m *writeBuf) {
+	cn.setWriteTimeout()
+	defer cn.cleanWriteTimeout()
 	n, err := cn.c.Write(m.wrap())
 	if err != nil {
 		if n == 0 {
@@ -935,6 +992,8 @@ func (cn *conn) send(m *writeBuf) {
 }
 
 func (cn *conn) sendStartupPacket(m *writeBuf) error {
+	cn.setWriteTimeout()
+	defer cn.cleanWriteTimeout()
 	_, err := cn.c.Write((m.wrap())[1:])
 	return err
 }
@@ -943,6 +1002,8 @@ func (cn *conn) sendStartupPacket(m *writeBuf) error {
 // message should have no payload.  This method does not use the scratch
 // buffer.
 func (cn *conn) sendSimpleMessage(typ byte) (err error) {
+	cn.setWriteTimeout()
+	defer cn.cleanWriteTimeout()
 	_, err = cn.c.Write([]byte{typ, '\x00', '\x00', '\x00', '\x04'})
 	return err
 }
@@ -972,6 +1033,9 @@ func (cn *conn) recvMessage(r *readBuf) (byte, error) {
 		cn.saveMessageBuffer = nil
 		return t, nil
 	}
+
+	cn.setReadTimeout()
+	defer cn.cleanReadTimeout()
 
 	x := cn.scratch[:5]
 	_, err := io.ReadFull(cn.buf, x)
@@ -1109,6 +1173,10 @@ func isDriverSetting(key string) bool {
 	case "disable_prepared_binary_result":
 		return true
 	case "binary_parameters":
+		return true
+	case "read_timeout":
+		return true
+	case "write_timeout":
 		return true
 	case "krbsrvname":
 		return true
